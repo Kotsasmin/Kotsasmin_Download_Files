@@ -2,6 +2,25 @@
 
 # encoding: utf-8
 
+# Copyright (C) 2021  Théo Rozier
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Core module of PortableMC, it provides a flexible API to download and start Minecraft.
+"""
+
 from typing import cast, Generator, Callable, Optional, Tuple, Dict, Type, List
 from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from urllib import parse as url_parse, request as url_request
@@ -35,12 +54,13 @@ __all__ = [
     "replace_vars", "replace_list_vars",
     "get_minecraft_dir", "get_minecraft_os", "get_minecraft_arch", "get_minecraft_archbits", "get_minecraft_jvm_os",
     "can_extract_native",
+    "from_iso_date",
     "LEGACY_JVM_ARGUMENTS"
 ]
 
 
 LAUNCHER_NAME = "portablemc"
-LAUNCHER_VERSION = "2.2.2"
+LAUNCHER_VERSION = "2.3.1"
 LAUNCHER_AUTHORS = ["Théo Rozier <contact@theorozier.fr>", "Github contributors"]
 LAUNCHER_COPYRIGHT = "PortableMC  Copyright (C) 2021  Théo Rozier"
 LAUNCHER_URL = "https://github.com/mindstorm38/portablemc"
@@ -169,8 +189,8 @@ class Version:
         elif version_super_meta is None:
             return version_meta, version_dir
         else:
-            installed_time = datetime.fromisoformat(version_meta["time"])
-            expected_time = datetime.fromisoformat(version_super_meta["time"])
+            installed_time = from_iso_date(version_meta["time"])
+            expected_time = from_iso_date(version_super_meta["time"])
             if installed_time >= expected_time:
                 return version_meta, version_dir
             else:
@@ -381,7 +401,7 @@ class Version:
                     lib_dl_entry = DownloadEntry(f"{lib_repo_url}{lib_path_raw}", lib_path, name=lib_dl_name)
 
             lib_libs.append(lib_path)
-            if lib_dl_entry is not None and (not path.isfile(lib_path) or path.getsize(lib_path) != lib_dl_entry.size):
+            if lib_dl_entry is not None and (not path.isfile(lib_path) or (lib_dl_entry.size is not None and path.getsize(lib_path) != lib_dl_entry.size)):
                 self.dl.append(lib_dl_entry)
 
     def prepare_jvm(self):
@@ -675,11 +695,19 @@ class Start:
         import atexit
         atexit.register(cleanup)
 
+        os.makedirs(bin_dir, exist_ok=True)
         for native_lib in self.version.native_libs:
             with ZipFile(native_lib, "r") as native_zip:
                 for native_zip_info in native_zip.infolist():
-                    if can_extract_native(native_zip_info.filename):
-                        native_zip.extract(native_zip_info, bin_dir)
+                    native_name = native_zip_info.filename
+                    if can_extract_native(native_name):
+                        try:
+                            native_name = native_name[native_name.rindex("/") + 1:]
+                        except ValueError:
+                            native_name = native_name
+                        with native_zip.open(native_zip_info, "r") as native_zip_file:
+                            with open(path.join(bin_dir, native_name), "wb") as native_file:
+                                shutil.copyfileobj(native_zip_file, native_file)
 
         self.args_replacements["natives_directory"] = bin_dir
 
@@ -1164,7 +1192,7 @@ class DownloadEntry:
 
     @classmethod
     def from_meta(cls, info: dict, dst: str, *, name: Optional[str] = None) -> 'DownloadEntry':
-        return DownloadEntry(info["url"], dst, size=info["size"], sha1=info["sha1"], name=name)
+        return DownloadEntry(info["url"], dst, size=info.get("size"), sha1=info.get("sha1"), name=name)
 
 
 class DownloadList:
@@ -1227,71 +1255,80 @@ class DownloadList:
 
                 conn_type = HTTPSConnection if (host[0] == "1") else HTTPConnection
                 conn = conn_type(host[1:])
-                max_entry_idx = len(entries) - 1
-                headers["Connection"] = "keep-alive"
 
-                for i, entry in enumerate(entries):
+                try:
 
-                    last_entry = (i == max_entry_idx)
-                    if last_entry:
-                        headers["Connection"] = "close"
+                    max_entry_idx = len(entries) - 1
+                    headers["Connection"] = "keep-alive"
 
-                    size_target = 0 if entry.size is None else entry.size
-                    error = None
+                    for i, entry in enumerate(entries):
 
-                    for _ in range(max_try_count):
+                        last_entry = (i == max_entry_idx)
+                        if last_entry:
+                            headers["Connection"] = "close"
 
-                        try:
-                            conn.request("GET", entry.url, None, headers)
-                            res = conn.getresponse()
-                        except ConnectionError:
-                            error = DownloadError.CONN_ERROR
-                            continue
+                        size_target = 0 if entry.size is None else entry.size
+                        error = None
 
-                        if res.status != 200:
-                            while res.readinto(buffer):
-                                pass  # This loop is used to skip all bytes in the stream, and allow further request.
-                            error = DownloadError.NOT_FOUND
-                            continue
+                        for _ in range(max_try_count):
 
-                        sha1 = None if entry.sha1 is None else hashlib.sha1()
-                        size = 0
+                            try:
+                                conn.request("GET", entry.url, None, headers)
+                                res = conn.getresponse()
+                            except ConnectionError:
+                                error = DownloadError.CONN_ERROR
+                                continue
 
-                        os.makedirs(path.dirname(entry.dst), exist_ok=True)
-                        with open(entry.dst, "wb") as dst_fp:
-                            while True:
-                                read_len = res.readinto(buffer)
-                                if not read_len:
-                                    break
-                                buffer_view = buffer[:read_len]
-                                size += read_len
-                                total_size += read_len
-                                if sha1 is not None:
-                                    sha1.update(buffer_view)
-                                dst_fp.write(buffer_view)
-                                if progress_callback is not None:
-                                    progress.size = total_size
-                                    entry_progress.name = entry.name
-                                    entry_progress.total = size_target
-                                    entry_progress.size = size
-                                    progress_callback(progress)
+                            if res.status != 200:
+                                while res.readinto(buffer):
+                                    pass  # This loop is used to skip all bytes in the stream, and allow further request.
+                                error = DownloadError.NOT_FOUND
+                                continue
 
-                        if entry.size is not None and size != entry.size:
-                            error = DownloadError.INVALID_SIZE
-                        elif entry.sha1 is not None and sha1.hexdigest() != entry.sha1:
-                            error = DownloadError.INVALID_SHA1
+                            sha1 = None if entry.sha1 is None else hashlib.sha1()
+                            size = 0
+
+                            os.makedirs(path.dirname(entry.dst), exist_ok=True)
+                            try:
+                                with open(entry.dst, "wb") as dst_fp:
+                                    while True:
+                                        read_len = res.readinto(buffer)
+                                        if not read_len:
+                                            break
+                                        buffer_view = buffer[:read_len]
+                                        size += read_len
+                                        total_size += read_len
+                                        if sha1 is not None:
+                                            sha1.update(buffer_view)
+                                        dst_fp.write(buffer_view)
+                                        if progress_callback is not None:
+                                            progress.size = total_size
+                                            entry_progress.name = entry.name
+                                            entry_progress.total = size_target
+                                            entry_progress.size = size
+                                            progress_callback(progress)
+                            except KeyboardInterrupt:
+                                if path.isfile(entry.dst):
+                                    os.remove(entry.dst)
+                                raise
+
+                            if entry.size is not None and size != entry.size:
+                                error = DownloadError.INVALID_SIZE
+                            elif entry.sha1 is not None and sha1.hexdigest() != entry.sha1:
+                                error = DownloadError.INVALID_SHA1
+                            else:
+                                if entry.size is None:
+                                    entry.size = size  # Enforce entry size from the effective downloaded size.
+                                    self.size += size
+                                break
+
+                            total_size -= size  # If error happened, subtract the size and restart from latest total_size.
+
                         else:
-                            if entry.size is None:
-                                entry.size = size  # Enforce entry size from the effective downloaded size.
-                                self.size += size
-                            break
+                            fails[entry.url] = error  # If the break was not triggered, an error should be set.
 
-                        total_size -= size  # If error happened, subtract the size and restart from latest total_size.
-
-                    else:
-                        fails[entry.url] = error  # If the break was not triggered, an error should be set.
-
-                conn.close()
+                finally:
+                    conn.close()
 
             if len(fails):
                 raise DownloadError(fails)
@@ -1551,7 +1588,17 @@ def get_minecraft_arch() -> str:
     global _minecraft_arch
     if _minecraft_arch is None:
         machine = platform.machine().lower()
-        _minecraft_arch = "x86" if machine in ("i386", "i686") else "x86_64" if machine in ("x86_64", "amd64", "ia64") else ""
+        _minecraft_arch = {
+            "i386": "x86",
+            "i686": "x86",
+            "x86_64": "x86_64",
+            "amd64": "x86_64",
+            "ia64": "x86_64",
+            "aarch64": "arm64",
+            "aarch32": "arm32",  # Don't know if this value is possible
+            "armv7l": "arm32",
+            "armv6l": "arm32",
+        }.get(machine, "")
     return _minecraft_arch
 
 
@@ -1580,7 +1627,26 @@ def get_minecraft_jvm_os() -> str:
 
 def can_extract_native(filename: str) -> bool:
     """ Return True if a file should be extracted to binaries directory. """
-    return not filename.startswith("META-INF") and not filename.endswith(".git") and not filename.endswith(".sha1")
+    return filename.endswith((".so", ".dll", ".dylib"))
+    # return not filename.startswith("META-INF") and not filename.endswith(".git") and not filename.endswith(".sha1")
+
+
+def from_iso_date(raw: str) -> datetime:
+    """
+    Replacement for `datetime.fromisoformat()` which is missing from Python 3.6. This function
+    replace it if needed.
+    Currently, only a subset of the ISO format is supported, both hours, minutes and seconds
+    must be defined and the timezone, if present must contain both hours and minutes, no more.
+    """
+    if hasattr(datetime, "fromisoformat"):
+        return datetime.fromisoformat(raw)
+    from datetime import timezone, timedelta
+    tz_idx = raw.find("+")
+    dt = datetime.strptime(raw[:tz_idx], "%Y-%m-%dT%H:%M:%S")
+    if tz_idx != -1:
+        tz_dt = datetime.strptime(raw[tz_idx + 1:], "%H:%M")
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=tz_dt.hour, minutes=tz_dt.minute)))
+    return dt
 
 
 LEGACY_JVM_ARGUMENTS = [
@@ -1892,6 +1958,7 @@ if __name__ == "__main__":
         parser.add_argument("--no-better-logging", help=_("args.start.no_better_logging"), action="store_true")
         parser.add_argument("--anonymise", help=_("args.start.anonymise"), action="store_true")
         parser.add_argument("--no-old-fix", help=_("args.start.no_old_fix"), action="store_true")
+        parser.add_argument("--lwjgl", help=_("args.start.lwjgl"), choices=["3.2.3", "3.3.0"])
         parser.add_argument("-t", "--temp-login", help=_("args.start.temp_login"), action="store_true")
         parser.add_argument("-l", "--login", help=_("args.start.login"))
         parser.add_argument("-m", "--microsoft", help=_("args.start.microsoft"), action="store_true")
@@ -1979,6 +2046,9 @@ if __name__ == "__main__":
         except (URLError, socket.gaierror, socket.timeout) as err:
             print_task("FAILED", "error.socket", {"reason": str(err)}, done=True, keep_previous=True)
             sys.exit(EXIT_FAILURE)
+        except KeyboardInterrupt:
+            print_task(None, "error.keyboard_interrupt", done=True, keep_previous=True)
+            sys.exit(EXIT_FAILURE)
     
     
     def cmd_search(ns: Namespace, ctx: CliContext):
@@ -1991,7 +2061,7 @@ if __name__ == "__main__":
         if ns.local:
             for version_id, mtime in ctx.list_versions():
                 if no_version or search in version_id:
-                    table.append((version_id, format_iso_date(mtime)))
+                    table.append((version_id, format_locale_date(mtime)))
         else:
             manifest = load_version_manifest(ctx)
             search, alias = manifest.filter_latest(search)
@@ -2002,7 +2072,7 @@ if __name__ == "__main__":
                         table.append((
                             version_data["type"],
                             version_id,
-                            format_iso_date(version_data["releaseTime"]),
+                            format_locale_date(version_data["releaseTime"]),
                             _("search.flags.local") if ctx.has_version_metadata(version_id) else ""
                         ))
             except VersionManifestError as err:
@@ -2035,6 +2105,17 @@ if __name__ == "__main__":
             print_task("", "start.version.resolving", {"version": version.id})
             version.prepare_meta()
             print_task("OK", "start.version.resolved", {"version": version.id}, done=True)
+    
+            version_fixes = []
+            if ns.lwjgl is not None:
+                fix_lwjgl_version(version, ns.lwjgl)
+                version_fixes.append(f"lwjgl-{ns.lwjgl}")
+                print_task("OK", "start.version.fixed.lwjgl", {"version": ns.lwjgl}, done=True)
+    
+            if len(version_fixes):
+                dump_meta_name = f"{version.id}.{'.'.join(version_fixes)}.dump.json"
+                with open(path.join(version.version_dir, dump_meta_name), "wt") as dump_meta_fp:
+                    json.dump(version.version_meta, dump_meta_fp, indent=2)
     
             print_task("", "start.version.jar.loading")
             version.prepare_jar()
@@ -2267,6 +2348,91 @@ if __name__ == "__main__":
         return StartOptions()
     
     
+    # Dynamic fixing method
+    
+    def fix_lwjgl_version(version: Version, lwjgl_version: str):
+    
+        lwjgl_libs = [
+            "lwjgl",
+            "lwjgl-jemalloc",
+            "lwjgl-openal",
+            "lwjgl-opengl",
+            "lwjgl-glfw",
+            "lwjgl-stb",
+            "lwjgl-tinyfd",
+        ]
+    
+        if lwjgl_version == "3.2.3":
+            lwjgl_natives = {
+                "arm32": {"linux": "natives-linux-arm32"},
+                "arm64": {"linux": "natives-linux-arm64"},
+                "x86": {"windows": "natives-windows-x86"},
+                "x86_64": {"windows": "natives-windows", "linux": "natives-linux", "osx": "natives-macos"}
+            }
+        elif lwjgl_version == "3.3.0":
+            lwjgl_natives = {
+                "arm32": {"linux": "natives-linux-arm32"},
+                "arm64": {"windows": "natives-windows-arm64", "linux": "natives-linux-arm64", "osx": "natives-macos-arm64"},
+                "x86": {"windows": "natives-windows-x86"},
+                "x86_64": {"windows": "natives-windows", "linux": "natives-linux", "osx": "natives-macos"}
+            }
+        else:
+            raise ValueError(f"Unsupported LWJGL version {lwjgl_version}")
+    
+        meta_libraries: list = version.version_meta["libraries"]
+    
+        libraries_to_remove = []
+        for idx, lib_obj in enumerate(meta_libraries):
+            if "name" in lib_obj and lib_obj["name"].startswith("org.lwjgl:"):
+                libraries_to_remove.append(idx)
+    
+        for idx_to_remove in reversed(libraries_to_remove):
+            meta_libraries.pop(idx_to_remove)
+    
+        maven_repo_url = "https://repo1.maven.org/maven2"
+    
+        for lwjgl_lib in lwjgl_libs:
+    
+            lib_path = f"org/lwjgl/{lwjgl_lib}/{lwjgl_version}/{lwjgl_lib}-{lwjgl_version}.jar"
+            lib_url = f"{maven_repo_url}/{lib_path}"
+            lib_name = f"org.lwjgl:{lwjgl_lib}:{lwjgl_version}"
+    
+            meta_libraries.append({
+                "downloads": {
+                    "artifact": {
+                        "path": lib_path,
+                        "url": lib_url
+                    }
+                },
+                "name": lib_name
+            })
+    
+            for lwjgl_arch, lwjgl_arch_natives in lwjgl_natives.items():
+    
+                arch_classifiers = {}
+    
+                for lwjgl_os, lwjgl_classifier in lwjgl_arch_natives.items():
+                    classifier_path = f"org/lwjgl/{lwjgl_lib}/{lwjgl_version}/{lwjgl_lib}-{lwjgl_version}-{lwjgl_classifier}.jar"
+                    classifier_url = f"{maven_repo_url}/{classifier_path}"
+                    arch_classifiers[lwjgl_classifier] = {
+                        "path": classifier_path,
+                        "url": classifier_url
+                    }
+    
+                meta_libraries.append({
+                    "downloads": {
+                        "artifact": {
+                            "path": lib_path,
+                            "url": lib_url
+                        },
+                        "classifiers": arch_classifiers
+                    },
+                    "natives": lwjgl_arch_natives,
+                    "name": lib_name,
+                    "rules": [{"action": "allow", "os": {"arch": lwjgl_arch}}]
+                })
+    
+    
     # CLI utilities
     
     def mixin(name: Optional[str] = None, into: Optional[object] = None):
@@ -2283,11 +2449,11 @@ if __name__ == "__main__":
         return mixin_decorator
     
     
-    def format_iso_date(raw: Union[str, float]) -> str:
+    def format_locale_date(raw: Union[str, float]) -> str:
         if isinstance(raw, float):
             return datetime.fromtimestamp(raw).strftime("%c")
         else:
-            return datetime.fromisoformat(str(raw)).strftime("%c")
+            return from_iso_date(str(raw)).strftime("%c")
     
     
     def format_number(n: int) -> str:
@@ -2359,7 +2525,7 @@ if __name__ == "__main__":
                 percentage = 100.0 if progress.total == 0 else min(100.0, progress.size / progress.total * 100.0)
                 entries = ", ".join((entry.name for entry in progress.entries))
                 path_len = max(0, min(80, get_term_width()) - non_path_len - len(speed))
-                print(f"[      ] {dl_text} {entries[:path_len].ljust(path_len)} {percentage:6.2f}% {speed}/s\r", end="")
+                print(f"\r[      ] {dl_text} {entries[:path_len].ljust(path_len)} {percentage:6.2f}% {speed}/s", end="")
                 called_once = True
     
         def complete_task(errors_count: int = 0):
@@ -2379,6 +2545,10 @@ if __name__ == "__main__":
             dl_list.callbacks.insert(0, complete_task)
             dl_list.download_files(progress_callback=progress_callback)
             return True
+        except KeyboardInterrupt:
+            if called_once:
+                print()
+            raise
         except DownloadError as err:
             complete_task(len(err.fails))
             for entry_url, entry_error in err.fails.items():
@@ -2667,6 +2837,9 @@ if __name__ == "__main__":
         "args.start.anonymise": "Anonymise your email or username for authentication messages.",
         "args.start.no_old_fix": "Flag that disable fixes for old versions (legacy merge sort, betacraft proxy), "
                                  "enabled by default.",
+        "args.start.lwjgl": "Change the default LWJGL version used by Minecraft, currently supporting '3.2.3' and '3.3.0'. "
+                            "This argument makes additional changes in order to support additional natives architectures. "
+                            "It's not guaranteed to work with every version of Minecraft.",
         "args.start.temp_login": "Flag used with -l (--login) to tell launcher not to cache your session if "
                                  "not already cached, disabled by default.",
         "args.start.login": "Use a email (or deprecated username) to authenticate using Mojang services (it override --username and --uuid).",
@@ -2699,7 +2872,8 @@ if __name__ == "__main__":
         # Json Request
         f"json_request.error.{JsonRequestError.INVALID_RESPONSE_NOT_JSON}": "Invalid JSON response from {method} {url}, status: {status}, data: {data}",
         # Misc errors
-        f"error.socket": "This operation requires an operational network, but a socket error happened: {reason}",
+        "error.socket": "This operation requires an operational network, but a socket error happened: {reason}",
+        "error.keyboard_interrupt": "Interrupted.",
         # Command search
         "search.type": "Type",
         "search.name": "Identifier",
@@ -2733,6 +2907,7 @@ if __name__ == "__main__":
         # Command start
         "start.version.resolving": "Resolving version {version}... ",
         "start.version.resolved": "Resolved version {version}.",
+        "start.version.fixed.lwjgl": "Fixed LWJGL version to {version}",
         "start.version.jar.loading": "Loading version JAR... ",
         "start.version.jar.loaded": "Loaded version JAR.",
         f"start.version.error.{VersionError.NOT_FOUND}": "Version {version} not found.",
